@@ -4,7 +4,7 @@
 “compatibility_date”: “2026-10-01”,
 “kv_namespaces”: [
 {
-“binding”: “KV_BINDING”,
+“binding”: “CFG”,
 “id”: “e3d5ee2c9365439fb027b3d73d602713”
 }
 ],
