@@ -1,18 +1,23 @@
+
 // Polymarket -> Telegram (e-sports)
-// Module Worker (Cloudflare Workers)
-// Cron recomendado: * * * * *
+// Module Worker (Cloudflare Workers) · cron: * * * * *
 //
-// Secrets (Worker Settings > Variables and Secrets):
-//   CHAVE                  token privado para proteger POST /config e POST /notify
-//   TELEGRAM_BOT_TOKEN     token do bot; o bot deve ser administrador com gestão de tópicos
+// Secrets (Settings > Variables and Secrets):
+//   CHAVE                  token privado que protege GET/POST /config e POST /notify
+//   TELEGRAM_BOT_TOKEN     token do bot (administrador do grupo, com gestão de tópicos)
+// Variável:
 //   TELEGRAM_CHAT_ID       ID do supergrupo com tópicos ativados
 //
-// Binding KV (namespace binding name: CFG):
-//   CFG / CFG               configuração das carteiras
-//   CFG / estado4           fila, cursores, deduplicação, resumo do dia, eventos
-//   CFG / topicos           tópicos por partida (chave = slug do evento)
-//   CFG / lock              (não é mais usada: a trava foi removida para economizar gravações)
-//   CFG / topico_atualizacoes  ID do tópico "Atualizações"
+// Binding KV (o nome do binding precisa ser exatamente: CFG), chaves usadas:
+//   CFG                    carteiras monitoradas
+//   estado4                fila, deduplicação, resumo do dia, lista, eventos
+//   topicos                tópicos por partida (chave = slug do evento)
+//   topico_atualizacoes    ID do tópico "Atualizações"
+//
+// Economia de escrita no KV (plano grátis = 1.000 escritas/dia):
+//   o estado só é gravado quando algo importante muda; o que muda a cada minuto
+//   (checkpoint, cursores, rodízio) fica na memória e vai ao KV a cada HEARTBEAT_MS.
+//   A trava de execução é em memória (não usa KV).
 
 const DATA_API = "https://data-api.polymarket.com";
 const GAMMA_API = "https://gamma-api.polymarket.com";
@@ -20,11 +25,9 @@ const FUSO = "America/Sao_Paulo";
 
 const KV_CFG = "CFG";
 const KV_ESTADO = "estado4";
-const KV_ESTADO_ANTIGO = "estado3";
 const KV_TOPICOS = "topicos";
-const KV_LOCK = "lock";
 
-const VERSAO = "2026-10-29-kv-v2";
+const VERSAO = "2026-10-31-placar-v3";
 const NOME_TOPICO_ATUALIZACOES = "Atualizações";
 
 const ESPORT = /(?:^|[-_\s/])(?:league[-_\s]?of[-_\s]?legends|lol|counter[-_\s]?strike|cs2|csgo|cs-go|dota[-_\s]?2?|valorant|rainbow[-_\s]?six|r6siege|r6|call[-_\s]?of[-_\s]?duty|cod(?:mw\d?)?|overwatch|ow2|rocket[-_\s]?league|rlcs|starcraft|mobile[-_\s]?legends|mlbb|honor[-_\s]?kings|hok|king[-_\s]?glory|kog|wild[-_\s]?rift|arena[-_\s]?of[-_\s]?valor)(?:$|[-_\s/])/i;
@@ -38,12 +41,13 @@ const JANELA_INICIAL_S = 3600;
 const MAX_VISTOS = 2000;
 const MAX_PENDENTES = 3000;
 const MAX_AVISOS = 6;
-const LOCK_MS = 55000;
+const GRANDE_USD = 1000;
+const TRAVA_MS = 55000;
+const HEARTBEAT_MS = 15 * 60 * 1000;
 const DIAS_TOPICO = 30;
 const TIMEOUT_FETCH_MS = 10000;
 const TENTATIVAS_METADADOS = 3;
 const RETRY_METADADOS_S = 30;
-const CHECKPOINT_MS = 15 * 60 * 1000; // grava o ponto de leitura no máximo a cada 15 min quando nada mudou
 
 const CORS = {
   "Access-Control-Allow-Origin": "*",
@@ -75,8 +79,6 @@ const numeroBR = (v, casas = 2) => Number(v || 0).toLocaleString("pt-BR", {
   minimumFractionDigits: casas, maximumFractionDigits: casas,
 });
 const moeda = v => "US$ " + numeroBR(v, 2);
-const pct = p => numeroBR(Number(p || 0) * 100, 1) + "%";
-const quantidade = v => numeroBR(v, 3);
 
 const fmtHora = new Intl.DateTimeFormat("pt-BR", { timeZone: FUSO, hour: "2-digit", minute: "2-digit", hourCycle: "h23" });
 const fmtHoraSeg = new Intl.DateTimeFormat("pt-BR", { timeZone: FUSO, hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23" });
@@ -150,15 +152,14 @@ function chaveTrade(n) {
     n.size.toFixed(6), n.price.toFixed(6), chaveTexto(n.outcome),
   ].join("|");
 }
-function chaveTradeAntiga(n) {
-  return [n.tx, n.cond, n.idx, n.side, n.size.toFixed(4), n.price.toFixed(4)].join("|");
-}
 function eEsports(n) {
   const slugTexto = `${n.eventSlug || ""} ${n.slug || ""}`;
   if (ESPORT.test(slugTexto)) return true;
   const t = `${n.titulo || ""} ${n.slug || ""}`.replace(/[-_]+/g, " ");
   return /\b(?:map\s*#?\s*\d{1,2}|mapa\s*#?\s*\d{1,2}|total\s+(?:de\s+)?maps?|maps?\s+(?:over|under)|map\s+handicap|mapas?\s+handicap|first\s+blood|total\s+rounds?|kills?|bo[1-7])\b/i.test(t);
 }
+const msgInexistente = d => /not found|can't be edited|message_id_invalid/i.test(String(d || ""));
+const naoModificada = d => /not[ _]modified/i.test(String(d || ""));
 const listaDe = body => body && Array.isArray(body.data) ? body.data : Array.isArray(body) ? body : [];
 
 function montarUrlTrades(w, start, end, cursor) {
@@ -249,7 +250,7 @@ function classificarMercado(n) {
     return { tipo: "placar", rotulo: numMapa ? `Placar do mapa ${numMapa}` : "Placar correto" };
   }
   if (/\b(first\s+blood|primeiro\s+sangue)\b/i.test(limpo)) return { tipo: "first_blood", rotulo: "First Blood" };
-  if (/\b(total\s+)?kirst\s+(?:tower|dragon|objective)\b|\btotal\s+rounds?\b|\brounds?\s+(?:over|under)\b|\btotal\s+points?\b/i.test(limpo)) {
+  if (/\bfirst\s+(?:tower|dragon|objective|baron)\b|\btotal\s+rounds?\b|\brounds?\s+(?:over|under)\b|\btotal\s+points?\b/i.test(limpo)) {
     let rotulo = /kills?/i.test(limpo) ? "Kills" : /rounds?/i.test(limpo) ? "Total de rodadas" : /tower|dragon|objective/i.test(limpo) ? "Objetivo da partida" : "Outro mercado";
     if (numMapa) rotulo += ` · mapa ${numMapa}`;
     return { tipo: "outro", rotulo };
@@ -285,8 +286,7 @@ function descreverAposta(n) {
     const linha = (resultado && resultado[2] ? resultado[2].replace(".", ",") : "") || linhaTotal(n);
     escolha = `${resultado && resultado[1].toLowerCase() === "over" ? "Mais de" : "Menos de"}${linha ? ` ${linha}` : " (linha não identificada)"}`;
   } else if (c.tipo === "handicap") {
-    let m = null;
-    for (const x of String(n.titulo || "").matchAll(/:\s*([^:()]+?)\s*\(([+-]?\d+(?:[.,]\d+)?)\)/g)) m = x;
+    const m = String(n.titulo || "").match(/:\s*(.+?)\s*\(([+-]?\d+(?:[.,]\d+)?)\)/);
     if (m) {
       const valor = Number(m[2].replace(",", "."));
       const linha = chaveTexto(m[1]) === chaveTexto(o) ? valor : -valor;
@@ -411,7 +411,7 @@ async function atualizarListaCarteiras(env, estado, cfg, forcar = false) {
   if (estado.lista.msgId) {
     const edit = await enviarComRetentativa(env, "editMessageText", { ...corpo, message_id: estado.lista.msgId });
     if (edit.ok) { estado.lista.hash = hashAtual; estado.lista.dia = diaHoje; estado.lista.mudou = false; return true; }
-    if (/message to edit not found|message_id_invalid|can't be edited/i.test(edit.desc || "")) {
+    if (msgInexistente(edit.desc)) {
       estado.lista.msgId = null;
     } else {
       console.warn("lista carteiras (edit): " + limpar(env, edit.desc).slice(0, 160));
@@ -454,13 +454,11 @@ async function atualizarResumo(env, estado, cfg) {
   const corpo = { chat_id: env.TELEGRAM_CHAT_ID, text: texto, parse_mode: "HTML", disable_web_page_preview: true };
   if (r.msgId) {
     const e = await enviarComRetentativa(env, "editMessageText", { ...corpo, message_id: r.msgId });
-    if (e.ok || /not[ _]modified/i.test(e.desc || "")) { r.mudou = false; return true; }
-    if (/not found|can't be edited|message_id_invalid|message to edit/i.test((e.desc || "").toLowerCase())) r.msgId = null;
+    if (e.ok || naoModificada(e.desc)) { r.mudou = false; return true; }
+    if (msgInexistente(e.desc)) r.msgId = null;
     else { console.warn("resumo diário: " + limpar(env, e.desc).slice(0, 160)); return false; }
   }
-  const topicoResumo = Number(env.TELEGRAM_TOPICO_RESUMO) || 0;
-  let novo = await enviarComRetentativa(env, "sendMessage", topicoResumo ? { ...corpo, message_thread_id: topicoResumo } : corpo);
-  if (!novo.ok && topicoResumo && novo.status === 400 && /thread|topic/i.test(novo.desc || "")) novo = await enviarComRetentativa(env, "sendMessage", corpo);
+  const novo = await enviarComRetentativa(env, "sendMessage", corpo);
   if (novo.ok && novo.result) { r.msgId = novo.result.message_id; r.mudou = false; return true; }
   console.warn("resumo diário não atualizado: " + limpar(env, novo.desc).slice(0, 160));
   return false;
@@ -506,57 +504,68 @@ async function salvarCarteiras(env, carteiras, base) {
   await env.CFG.put(KV_CFG, JSON.stringify({ carteiras: lista, atualizado }));
   return { salvas: lista.length, ignoradas, atualizado };
 }
-async function migrarFilaAntiga(env) {
-  try {
-    const raw = await env.CFG.get(KV_ESTADO_ANTIGO);
-    if (!raw) return [];
-    const a = JSON.parse(raw);
-    const lista = [a.pendentes, a.pending, a.fila, a.queue].find(Array.isArray) || [];
-    const out = [];
-    for (const item of lista) {
-      const n = normalizar((item && (item.t || item.trade)) || item);
-      if (!n || !n.cond || !eEsports(n)) continue;
-      const w = String((item && item.c && item.c.w) || (item && item.w) || n.w).toLowerCase();
-      if (!/^0x[a-f0-9]{40}$/.test(w)) continue;
-      const id = `${w}|${chaveTrade(n)}`;
-      out.push({ id, w, n, tent: 0, nextTryAt: 0 });
-    }
-    return out;
-  } catch (e) {
-    console.warn("migração de fila antiga: " + limpar(env, e).slice(0, 120));
-    return [];
+// Campos que mudam a cada minuto e NÃO justificam uma escrita no KV: ultimo, coletas,
+// indiceCarteira, nextTryAt. Ficam em memória (memVol) e vão ao KV só no heartbeat.
+let memVol = null;
+
+function assinaturaEstado(e) {
+  const vistos = Object.entries(e.vistos).map(([w, a]) => `${w}:${a.length}:${a[a.length - 1] || ""}`);
+  return JSON.stringify([
+    e.pendentes.map(it => [it.id, Math.min(Number(it.tent || 0), TENTATIVAS_METADADOS)]),
+    vistos, e.resumo, e.lista, e.eventos,
+  ]);
+}
+function aplicarMemoria(e) {
+  if (!memVol || memVol.em < Number(e.salvoEm || 0)) return;
+  for (const [w, t] of Object.entries(memVol.ultimo)) if (t > Number(e.ultimo[w] || 0)) e.ultimo[w] = t;
+  e.coletas = memVol.coletas;
+  e.indiceCarteira = memVol.indiceCarteira;
+  for (const it of e.pendentes) {
+    const r = memVol.retry[it.id];
+    if (r) { it.tent = r.tent; it.nextTryAt = r.nextTryAt; }
   }
 }
+function guardarMemoria(e) {
+  const retry = {};
+  for (const it of e.pendentes) if (it.tent || it.nextTryAt) retry[it.id] = { tent: it.tent || 0, nextTryAt: it.nextTryAt || 0 };
+  memVol = { em: Date.now(), ultimo: e.ultimo, coletas: e.coletas, indiceCarteira: e.indiceCarteira, retry };
+}
+
 async function lerEstado(env) {
   const raw = await env.CFG.get(KV_ESTADO);
   let e;
   if (raw) {
     try { e = JSON.parse(raw); } catch (_) { throw new Error("estado4 corrompido; interrompi para não sobrescrever a fila"); }
   } else {
-    e = { pendentes: await migrarFilaAntiga(env), vistos: {}, ultimo: {}, coletas: {}, resumo: null, lista: null, eventos: {}, indiceCarteira: 0 };
+    e = { pendentes: [], vistos: {}, ultimo: {}, coletas: {}, resumo: null, lista: null, eventos: {}, indiceCarteira: 0 };
   }
   e.pendentes = Array.isArray(e.pendentes) ? e.pendentes.filter(it => it && it.n && it.w) : [];
   e.vistos = e.vistos && typeof e.vistos === "object" ? e.vistos : {};
+  for (const w of Object.keys(e.vistos)) if (!Array.isArray(e.vistos[w])) e.vistos[w] = [];
   e.ultimo = e.ultimo && typeof e.ultimo === "object" ? e.ultimo : {};
   e.coletas = e.coletas && typeof e.coletas === "object" ? e.coletas : {};
   e.resumo = e.resumo && typeof e.resumo === "object" ? e.resumo : null;
   e.lista = e.lista && typeof e.lista === "object" ? e.lista : null;
   e.eventos = e.eventos && typeof e.eventos === "object" && !Array.isArray(e.eventos) ? e.eventos : {};
   e.indiceCarteira = Number.isInteger(e.indiceCarteira) && e.indiceCarteira >= 0 ? e.indiceCarteira : 0;
+  Object.defineProperty(e, "_sig", { value: assinaturaEstado(e), writable: true, enumerable: false });
+  aplicarMemoria(e);
   return e;
 }
-async function salvarEstado(env, estado) { await env.CFG.put(KV_ESTADO, JSON.stringify(estado)); }
-
-// Imagem do estado SEM o ponto de leitura (ultimo/salvoEm), que muda a cada minuto.
-// Serve para saber se houve mudança "de verdade" e só então gravar no KV.
-function semCheckpoint(e) {
-  const { ultimo, salvoEm, ...resto } = e;
-  return JSON.stringify(resto);
+// Grava só se algo importante mudou ou se o heartbeat venceu. Retorna true se gravou.
+async function salvarEstado(env, estado) {
+  const agora = Date.now();
+  const mudou = assinaturaEstado(estado) !== estado._sig;
+  if (!mudou && agora - Number(estado.salvoEm || 0) < HEARTBEAT_MS) return false;
+  estado.salvoEm = agora;
+  await env.CFG.put(KV_ESTADO, JSON.stringify(estado));
+  estado._sig = assinaturaEstado(estado);
+  return true;
 }
-
 async function lerTopicos(env) {
   const raw = await env.CFG.get(KV_TOPICOS);
-  if (!raw) return {};
+  const marcar = o => Object.defineProperty(o, "_raw", { value: JSON.stringify(o), writable: true, enumerable: false });
+  if (!raw) return marcar({});
   let v;
   try { v = JSON.parse(raw); } catch (_) { return null; }
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
@@ -570,22 +579,31 @@ async function lerTopicos(env) {
         nome: String(val.nome || ""), 
         inicioMs: Number(val.inicioMs || 0), 
         dia: String(val.dia || ""),
-        resumo: val.resumo && typeof val.resumo === "object" ? val.resumo : { msgId: null, mercados: {} }
+        resumo: val.resumo && typeof val.resumo === "object" ? val.resumo : { msgId: null, mercados: {} },
+        carteiras: val.carteiras && typeof val.carteiras === "object" ? val.carteiras : {},
       };
     }
   }
-  return out;
+  return marcar(out);
 }
+// Grava só se mudou em relação ao que foi lido.
 async function salvarTopicos(env, topicos) {
   const limite = diaBR(Date.now() - DIAS_TOPICO * 86400000);
   for (const [k, v] of Object.entries(topicos)) if (v && v.dia && v.dia < limite) delete topicos[k];
-  await env.CFG.put(KV_TOPICOS, JSON.stringify(topicos));
+  const novo = JSON.stringify(topicos);
+  if (novo === topicos._raw) return false;
+  await env.CFG.put(KV_TOPICOS, novo);
+  topicos._raw = novo;
+  return true;
 }
-
-// A trava no KV foi removida: gravava e apagava a chave a cada minuto (2 operações/min)
-// e estourava a cota diária do plano gratuito. O cron do Cloudflare já não sobrepõe execuções.
-async function pegarLock(env) { return true; }
-const soltarLock = env => Promise.resolve();
+// Trava em memória: evita dois ciclos ao mesmo tempo no mesmo isolate (sem gastar KV).
+let travaAte = 0;
+function pegarTrava() {
+  if (Date.now() < travaAte) return false;
+  travaAte = Date.now() + TRAVA_MS;
+  return true;
+}
+const soltarTrava = () => { travaAte = 0; };
 
 function selecionarCarteiras(carteiras, estado) {
   if (carteiras.length <= CARTEIRAS_POR_CICLO) return carteiras;
@@ -626,7 +644,6 @@ async function coletarCarteira(c, estado) {
         if (!n || !n.cond || !eEsports(n)) continue;
         const k = chaveTrade(n);
         if (existentes.has(k)) continue;
-        if (existentes.has(chaveTradeAntiga(n))) { existentes.add(k); continue; }
         if (estado.pendentes.length >= MAX_PENDENTES) { filaCheia = true; break; }
         existentes.add(k);
         estado.pendentes.push({ id: `${w}|${k}`, w, n, tent: 0, nextTryAt: 0 });
@@ -742,38 +759,48 @@ function nomeTopicoPartida(ev, n) {
   return truncar(base, 128);
 }
 
-function textoGrupo(env, g, cfg, ev) {
-  const nome = nomeCarteira(cfg, g.w);
-  const n0 = g.itens[0] && g.itens[0].n;
-  const titulo = ev && ev.times ? `${ev.times.a} vs ${ev.times.b}` : (ev && ev.titulo) || (n0 && n0.titulo) || "Partida";
-  const quando = ev && ev.inicioMs ? `🕒 ${diaCurtoBR(ev.inicioMs)} · ${horaBR(ev.inicioMs)}` : ev && ev.data ? `📅 ${diaComAnoBR(ev.data)}` : "";
+const dolar = v => "US$ " + numeroBR(v, v >= 100 ? 0 : 2);
+const centavos = p => { const c = Number(p || 0) * 100; return numeroBR(c, c < 10 ? 1 : 0) + "¢"; };
 
-  const agregado = new Map();
+// Uma entrada por mercado + escolha + lado (compra/venda).
+function agregarGrupo(g) {
+  const mapa = new Map();
   for (const it of g.itens) {
     const d = descreverAposta(it.n);
-    const chave = `${d.classificacao.rotulo} - ${d.escolha}`;
-    
-    if (!agregado.has(chave)) {
-      agregado.set(chave, { rotulo: d.classificacao.rotulo, escolha: d.escolha, sizeTotal: 0, valorTotal: 0, qtd: 0 });
-    }
-    
-    const a = agregado.get(chave);
-    const valor = Number(it.n.size || 0) * Number(it.n.price || 0);
-    a.sizeTotal += Number(it.n.size || 0);
-    a.valorTotal += valor;
+    const venda = it.n.side === "SELL";
+    const chave = `${d.classificacao.rotulo}|${d.escolha}|${venda}`;
+    if (!mapa.has(chave)) mapa.set(chave, { tipo: d.classificacao.tipo, rotulo: d.classificacao.rotulo, escolha: d.escolha, venda, size: 0, valor: 0, qtd: 0 });
+    const a = mapa.get(chave);
+    const size = Number(it.n.size || 0);
+    a.size += size;
+    a.valor += size * Number(it.n.price || 0);
     a.qtd++;
   }
+  return [...mapa.values()];
+}
 
-  const corpo = [...agregado.values()].map(a => {
-    const precoMedio = a.sizeTotal > 0 ? (a.valorTotal / a.sizeTotal) : 0;
-    const notaExecucoes = a.qtd > 1 ? ` <i>(${a.qtd}x)</i>` : "";
-    return `<b>${esc(a.rotulo)}</b>\n→ ${esc(a.escolha)}\n<i>${moeda(a.valorTotal)} · ${quantidade(a.sizeTotal)} cotas @ ${numeroBR(precoMedio, 3)} · ${pct(precoMedio)}</i>${notaExecucoes}`;
-  }).join("\n\n");
-
-  const linhas = [`🎯 <b>${esc(titulo)}</b>`];
-  if (quando) linhas.push(quando);
-  linhas.push("", `👤 <b>${esc(nome)}</b>`, "", corpo, "", `<i>${horaSegBR(Date.now())} · ${VERSAO}</i>`);
-  return linhas.join("\n");
+// Uma linha por aposta: ícone · carteira · escolha · valor @ preço [· Σ acumulado] [⚠️ outros lados].
+// Partida e horário não entram: já estão no nome do tópico.
+function textoGrupo(g, cfg, topico) {
+  const nome = esc(truncar(nomeCarteira(cfg, g.w), 18));
+  const antes = (topico && topico.carteiras && topico.carteiras[g.w]) || { total: 0, lados: {} };
+  const ags = agregarGrupo(g);
+  const compras = ags.filter(a => !a.venda);
+  const totalDepois = Number(antes.total || 0) + compras.reduce((t, a) => t + a.valor, 0);
+  return ags.map(a => {
+    const preco = a.size > 0 ? a.valor / a.size : 0;
+    const comRotulo = a.tipo !== "vencedor" || /^(sim|não)$/i.test(a.escolha);
+    const alvo = esc(comRotulo ? `${a.rotulo}: ${a.escolha}` : a.escolha);
+    const base = `<b>${nome}</b> · ${alvo} · ${dolar(a.valor)} @ ${centavos(preco)}`;
+    if (a.venda) return `🔴 ${nome} vendeu · ${alvo} · ${dolar(a.valor)} @ ${centavos(preco)}`;
+    let extra = "";
+    if (totalDepois - a.valor > 0.5) extra += ` · Σ ${numeroBR(totalDepois, 0)}`;
+    const outros = new Set(Object.keys((antes.lados && antes.lados[a.rotulo]) || {}));
+    for (const o of compras) if (o.rotulo === a.rotulo) outros.add(o.escolha);
+    outros.delete(a.escolha);
+    if (outros.size) extra += ` ⚠️ +${esc(truncar([...outros].join(", "), 30))}`;
+    return `${a.valor >= GRANDE_USD ? "🔥" : "🟢"} ${base}${extra}`;
+  }).join("\n");
 }
 
 function agrupar(pendentes) {
@@ -790,45 +817,70 @@ function agrupar(pendentes) {
 
 function registrarNoResumo(topico, g) {
   if (!topico.resumo) topico.resumo = { msgId: null, mercados: {} };
-  
-  for (const it of g.itens) {
-    const d = descreverAposta(it.n);
-    const chaveM = `${d.classificacao.rotulo.replace(' da partida', '')} - ${d.escolha}`;
-    const valor = Number(it.n.size || 0) * Number(it.n.price || 0);
-    
-    if (!topico.resumo.mercados[chaveM]) {
-      topico.resumo.mercados[chaveM] = { valor: 0, qtd: 0 };
-    }
-    
-    topico.resumo.mercados[chaveM].valor += valor;
-    topico.resumo.mercados[chaveM].qtd += 1;
+  if (!topico.carteiras) topico.carteiras = {};
+  const c = topico.carteiras[g.w] || (topico.carteiras[g.w] = { total: 0, qtd: 0, lados: {} });
+  for (const a of agregarGrupo(g)) {
+    if (a.venda) continue; // venda não é dinheiro novo: não entra no placar nem no acumulado
+    const chaveM = `${a.rotulo.replace(" da partida", "")} - ${a.escolha}`;
+    const m = topico.resumo.mercados[chaveM] || (topico.resumo.mercados[chaveM] = { valor: 0, qtd: 0 });
+    m.valor += a.valor;
+    m.qtd += a.qtd;
+    m.cotas = (m.cotas || 0) + a.size;
+    if (!Array.isArray(m.ws)) m.ws = [];
+    if (!m.ws.includes(g.w)) m.ws.push(g.w);
+    c.total += a.valor;
+    c.qtd += a.qtd;
+    const lado = c.lados[a.rotulo] || (c.lados[a.rotulo] = {});
+    lado[a.escolha] = (lado[a.escolha] || 0) + a.valor;
   }
 }
 
-async function atualizarPlacarVivo(env, topico) {
+function textoPlacar(topico, cfg) {
+  const mercados = (topico.resumo && topico.resumo.mercados) || {};
+  const grupos = new Map();
+  const carteiras = new Set(Object.keys(topico.carteiras || {}));
+  let total = 0, apostas = 0;
+  for (const [chave, d] of Object.entries(mercados)) {
+    const i = chave.indexOf(" - ");
+    const rotulo = i > 0 ? chave.slice(0, i) : "Mercado";
+    const escolha = i > 0 ? chave.slice(i + 3) : chave;
+    if (!grupos.has(rotulo)) grupos.set(rotulo, { rotulo, total: 0, itens: [] });
+    const gr = grupos.get(rotulo);
+    gr.total += Number(d.valor || 0);
+    gr.itens.push({ escolha, ...d });
+    total += Number(d.valor || 0);
+    apostas += Number(d.qtd || 0);
+    for (const w of Array.isArray(d.ws) ? d.ws : []) carteiras.add(w);
+  }
+  const blocos = [...grupos.values()].sort((a, b) => b.total - a.total).map(gr => {
+    const linhas = gr.itens.sort((a, b) => b.valor - a.valor).map(it => {
+      const partes = [`<b>${esc(it.escolha)}</b>`, dolar(it.valor)];
+      if (gr.itens.length > 1 && gr.total > 0) {
+        const p = it.valor / gr.total * 100;
+        partes.push(p < 1 ? "&lt;1%" : p > 99 ? "&gt;99%" : `${Math.round(p)}%`);
+      }
+      if (it.cotas > 0) partes.push(`@${centavos(it.valor / it.cotas)}`);
+      const ws = Array.isArray(it.ws) ? it.ws : [];
+      if (ws.length && ws.length <= 2) partes.push(ws.map(w => esc(truncar(nomeCarteira(cfg, w), 12))).join(", "));
+      else if (ws.length > 2) partes.push(`👤${ws.length}`);
+      return `▸ ${partes.join(" · ")}`;
+    });
+    return `<b>${esc(gr.rotulo)}</b>\n${linhas.join("\n")}`;
+  });
+  const rodape = `💰 <b>${dolar(total)}</b> · ${apostas} aposta${apostas === 1 ? "" : "s"}${carteiras.size ? ` · 👤${carteiras.size}` : ""}`;
+  return `📊 <b>${esc(topico.nome || "Partida")}</b>\n\n` + (blocos.length ? blocos.join("\n\n") + "\n\n" + rodape : "<i>nenhuma aposta registrada</i>");
+}
+
+async function atualizarPlacarVivo(env, topico, cfg) {
   if (!topico.resumo || !topico.resumo.mercados) return;
-  let totalGeral = 0;
-  let totalApostas = 0;
-  const entradas = Object.entries(topico.resumo.mercados)
-    .sort((a, b) => b[1].valor - a[1].valor)
-    .map(([mercado, dados]) => {
-      totalGeral += Number(dados.valor || 0);
-      totalApostas += Number(dados.qtd || 0);
-      return `▪️ <b>${esc(mercado)}</b>\n   └ ${dados.qtd} aposta(s) · ${moeda(dados.valor)}`;
-    }).join("\n\n");
-  const texto = `📊 <b>PLACAR AO VIVO</b>\n` +
-    `🎯 <b>${esc(topico.nome || "Partida")}</b>\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n\n` +
-    `${entradas || "— nenhuma aposta registrada —"}\n\n` +
-    `━━━━━━━━━━━━━━━━━━━━\n` +
-    `💰 <b>TOTAL GERAL:</b> ${moeda(totalGeral)} · ${totalApostas} aposta(s)`;
+  const texto = textoPlacar(topico, cfg);
   if (topico.resumo.msgId) {
     const edit = await enviarComRetentativa(env, "editMessageText", {
       chat_id: env.TELEGRAM_CHAT_ID, message_id: topico.resumo.msgId, text: texto,
       parse_mode: "HTML", disable_web_page_preview: true
     });
-    if (edit.ok || /message is not modified|not[ _]modified/i.test(edit.desc || "")) return;
-    if (/message to edit not found|message_id_invalid|can't be edited/i.test((edit.desc || "").toLowerCase())) topico.resumo.msgId = null;
+    if (edit.ok || naoModificada(edit.desc)) return;
+    if (msgInexistente(edit.desc)) topico.resumo.msgId = null;
     else { console.warn("Falha ao editar placar: " + limpar(env, edit.desc).slice(0, 160)); return; }
   }
   if (!topico.resumo.msgId) {
@@ -839,6 +891,22 @@ async function atualizarPlacarVivo(env, topico) {
     if (novo.ok && novo.result) topico.resumo.msgId = novo.result.message_id;
     else console.warn("Falha ao enviar placar: " + limpar(env, novo.desc || novo.status).slice(0, 160));
   }
+}
+
+async function criarTopicoPartida(env, ev, n) {
+  const nome = nomeTopicoPartida(ev, n);
+  const r = await enviarComRetentativa(env, "createForumTopic", { chat_id: env.TELEGRAM_CHAT_ID, name: nome });
+  if (!r.ok || !r.result || !r.result.message_thread_id) return { erro: r };
+  return {
+    topico: {
+      id: r.result.message_thread_id,
+      nome,
+      inicioMs: (ev && ev.inicioMs) || 0,
+      dia: (ev && ev.data) || diaBR(Date.now()),
+      resumo: { msgId: null, mercados: {} },
+      carteiras: {},
+    },
+  };
 }
 
 async function enviarGrupo(env, g, cfg, topicos, cacheEventos, estado) {
@@ -860,46 +928,28 @@ async function enviarGrupo(env, g, cfg, topicos, cacheEventos, estado) {
 
   let topico = topicos[chaveEv];
   if (!topico || !(topico.id > 0)) {
-    const nome = nomeTopicoPartida(ev, n);
-    const r = await enviarComRetentativa(env, "createForumTopic", { chat_id: env.TELEGRAM_CHAT_ID, name: nome });
-    if (!r.ok || !r.result || !r.result.message_thread_id) {
-      return { ok: false, status: r.status || 0, desc: "falha ao criar tópico: " + (r.desc || "") };
-    }
-    topico = { 
-      id: r.result.message_thread_id, 
-      nome, 
-      inicioMs: (ev && ev.inicioMs) || 0, 
-      dia: (ev && ev.data) || diaBR(Date.now()),
-      resumo: { msgId: null, mercados: {} }
-    };
-    topicos[chaveEv] = topico;
+    const c = await criarTopicoPartida(env, ev, n);
+    if (c.erro) return { ok: false, status: c.erro.status || 0, desc: "falha ao criar tópico: " + (c.erro.desc || "") };
+    topico = topicos[chaveEv] = c.topico;
   }
 
   if (estado) { if (!estado.eventos) estado.eventos = {}; estado.eventos[n.cond] = chaveEv; }
 
-  const corpo = { chat_id: env.TELEGRAM_CHAT_ID, message_thread_id: topico.id, text: textoGrupo(env, g, cfg, ev), parse_mode: "HTML", disable_web_page_preview: true };
+  const corpo = { chat_id: env.TELEGRAM_CHAT_ID, message_thread_id: topico.id, text: textoGrupo(g, cfg, topico), parse_mode: "HTML", disable_web_page_preview: true };
   let r = await enviarComRetentativa(env, "sendMessage", corpo);
 
   if (!r.ok && r.status === 400 && /thread|topic|TOPIC_ID_INVALID|TOPIC_DELETED/i.test(r.desc || "")) {
     delete topicos[chaveEv];
-    const nome = nomeTopicoPartida(ev, n);
-    const rec = await enviarComRetentativa(env, "createForumTopic", { chat_id: env.TELEGRAM_CHAT_ID, name: nome });
-    if (rec.ok && rec.result && rec.result.message_thread_id) {
-      topico = { 
-        id: rec.result.message_thread_id, 
-        nome, 
-        inicioMs: (ev && ev.inicioMs) || 0, 
-        dia: (ev && ev.data) || diaBR(Date.now()),
-        resumo: { msgId: null, mercados: {} }
-      };
-      topicos[chaveEv] = topico;
+    const c = await criarTopicoPartida(env, ev, n);
+    if (c.topico) {
+      topico = topicos[chaveEv] = c.topico;
       r = await enviarComRetentativa(env, "sendMessage", { ...corpo, message_thread_id: topico.id });
     }
   }
 
   if (r.ok && r.result) {
     registrarNoResumo(topico, g);
-    await atualizarPlacarVivo(env, topico);
+    await atualizarPlacarVivo(env, topico, cfg);
     return { ok: true, result: r.result, topicoId: topico.id };
   }
   
@@ -911,18 +961,15 @@ async function ciclo(env, origem) {
   const faltam = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "CFG"].filter(k => !env[k]);
   if (faltam.length) return { ...resultado, erros: ["faltam configurações: " + faltam.join(", ")] };
 
-  let lockObtido = false;
+  let travaObtida = false;
   let estado = null;
   let topicos = null;
-  let snapEstado = "";
-  let snapTop = "";
   try {
-    lockObtido = await pegarLock(env);
-    if (!lockObtido) return { ...resultado, ocupado: true };
+    travaObtida = pegarTrava();
+    if (!travaObtida) return { ...resultado, ocupado: true };
     const cfg = await lerConfig(env);
     resultado.carteiras = cfg.carteiras.length;
     estado = await lerEstado(env);
-    snapEstado = semCheckpoint(estado);
     podarCarteirasRemovidas(estado, cfg);
     sincronizarResumo(estado, cfg);
 
@@ -933,7 +980,6 @@ async function ciclo(env, origem) {
       resultado.erros.push("registro de tópicos ilegível; ciclo interrompido para evitar duplicações");
       return resultado;
     }
-    snapTop = JSON.stringify(topicos);
 
     if (estado.pendentes.length < MAX_PENDENTES && cfg.carteiras.length) {
       const coleta = await coletar(cfg, estado);
@@ -968,7 +1014,6 @@ async function ciclo(env, origem) {
     estado.pendentes = estado.pendentes.filter(it => !enviados.has(it.id));
     if (estado.resumo && estado.resumo.mudou) await atualizarResumo(env, estado, cfg);
     resultado.pendentes = estado.pendentes.length;
-    resultado.proximoCursor = Object.keys(estado.coletas).length;
   } catch (e) {
     resultado.erros.push(truncar(limpar(env, e), 300));
   } finally {
@@ -980,18 +1025,15 @@ async function ciclo(env, origem) {
           if (!t || (t.dia && t.dia < limite)) delete estado.eventos[cond];
         }
       }
-      // Só grava no KV quando algo mudou de verdade (ou a cada 15 min, para guardar o ponto de leitura).
-      if (estado && (semCheckpoint(estado) !== snapEstado || Date.now() - Number(estado.salvoEm || 0) > CHECKPOINT_MS)) {
-        estado.salvoEm = Date.now();
-        await salvarEstado(env, estado);
+      if (estado) {
+        resultado.gravouEstado = await salvarEstado(env, estado);
+        guardarMemoria(estado);
       }
-      if (topicos && JSON.stringify(topicos) !== snapTop) await salvarTopicos(env, topicos);
+      if (topicos) resultado.gravouTopicos = await salvarTopicos(env, topicos);
     } catch (e) {
       resultado.erros.push("persistência KV: " + truncar(limpar(env, e), 200));
     }
-    if (lockObtido) {
-      try { await soltarLock(env); } catch (e) { resultado.erros.push("liberação da trava: " + truncar(limpar(env, e), 120)); }
-    }
+    if (travaObtida) soltarTrava();
   }
   return resultado;
 }
@@ -1043,14 +1085,6 @@ export default {
         return jsonResp({ ok: true, ...salvos, versao: VERSAO });
       }
 
-      if (body && (body.titulo || body.corpo)) {
-        const topicoId = await garantirTopicoAtualizacoes(env);
-        const msg = { chat_id: env.TELEGRAM_CHAT_ID, text: `<b>${esc(truncar(body.titulo || "Aviso", 200))}</b>\n${esc(truncar(body.corpo || "", 3000))}`, parse_mode: "HTML", disable_web_page_preview: true };
-        if (topicoId) msg.message_thread_id = topicoId;
-        const r = await enviarComRetentativa(env, "sendMessage", msg);
-        if (!r.ok) return jsonResp({ ok: false, erro: truncar(limpar(env, r.desc || r.status), 300), versao: VERSAO }, 502);
-        return jsonResp({ ok: true, enviado: true, versao: VERSAO });
-      }
       const out = { ok: true, versao: VERSAO };
       if (body && Array.isArray(body.carteiras)) {
         Object.assign(out, await salvarCarteirasPayload(env, body));
